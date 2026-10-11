@@ -2,16 +2,17 @@
 
 上帝视角 2D 驾驶小游戏：踩油门提速，踩刹车受力，**踏板受力达到 1600 N 会断裂**，随后弹出失败标语「遥遥领先」和重试按钮。
 
-**电脑、手机都能玩**，纯单文件、无任何依赖、不需要联网（也支持离线打开）。
+**电脑、手机都能玩**，纯单文件、无任何依赖、不需要联网（也能离线打开）。
 
-## 🎮 直接开玩
+## 🎮 直接开玩（两条链接，任选其一）
 
 | 链接 | 说明 |
 | --- | --- |
-| **https://caome886.github.io/brake-simulator/** | GitHub Pages，点开即玩（推荐分享） |
+| **https://celadon-speculoos-cb5922.netlify.app/** | Netlify 托管（亚洲节点，国内相对更通） |
+| **https://caome886.github.io/brake-simulator/** | GitHub Pages（源码同步发布） |
 | https://github.com/caome886/brake-simulator | 源码仓库 |
 
-> 如果国内网络打开 `github.io` 不稳定，见文末「访问不了怎么办」。
+> 国内网络下 `github.io` 属于"时通时不通"（走 Fastly CDN，DNS 易被污染）。实测：多数海外节点返回 200，但香港节点出现 `Connection refused`。若打不开，换另一条链接或见文末「访问不了怎么办」。
 
 ## 怎么玩
 
@@ -83,7 +84,7 @@ node serve.js
 ```powershell
 node cdp-test.js          # 键盘/鼠标：加速曲线、按住刹车、松开归零、断裂、失败、重试
 node cdp-mobile-test.js   # 手机仿真（390x844 触摸屏）：按钮、多点触控、重试、自动隐藏、横屏不遮挡
-node cdp-live-test.js     # 对线上网址做端到端验收
+node cdp-live-test.js <网址>   # 对线上网址做端到端验收
 ```
 
 手机端断言：识别为触屏设备、按钮尺寸够大（≥44px）→ 单指按加速 → **两指同按加速+刹车** → 抬指立即停止输入 → 单指刹车受力增长并减速 → 1600 N 断裂并进入失败界面 → 点画面重试复位 → 按钮栏自动隐藏 → 横屏时画面与按钮栏**零重叠**且点画面上半部识别为加速。
@@ -101,38 +102,48 @@ node cdp-live-test.js     # 对线上网址做端到端验收
 | 手机竖屏 390×844 | 画面 358×209，按钮 179×110，画面完全在按钮栏上方 |
 | 手机横屏 844×390 | 画面 480×280，与按钮栏零重叠 |
 
-## 发布到网上
+## 发布 / 更新部署
 
-内置脚本用 GitHub API 建仓库、推送源码并开启 GitHub Pages（不需要安装 git）：
+### GitHub（源码 + Pages）
 
 ```powershell
-# 1) 生成一个有 repo 权限的 token，存到 gh-token.txt（只放一行 token）
+# 1) 准备一个 repo 权限的 token，写入 gh-token.txt（只放一行）
 #    快捷链接：https://github.com/settings/tokens/new?scopes=repo,workflow&description=brake-simulator-deploy
-# 2) 发布
-node deploy.js                  # 仓库名默认 brake-simulator
-node deploy.js my-repo-name     # 指定仓库名
+#    也可以让脚本自动生成：先开一个带调试端口的 Chrome 并登录 GitHub，然后
+#      node gh-make-token.js fill && node gh-make-token.js submit
+# 2) 发布 / 更新
+node deploy.js                  # 更新已有仓库
 node deploy.js --check          # 只验证 token
 ```
 
-`gh-token.txt` 已加入 `.gitignore`，不会被推送。
+`gh-token.txt`、`.gh-browser/` 已加入 `.gitignore`，不会推送。
+
+### Netlify（免登录拖拽发布，再认领为长期站点）
+
+```powershell
+node netlify-deploy.js          # 把 netlify-site.zip 上传到 Netlify Drop 并打印站点网址
+```
+
+注意：未认领的 Drop 站点**1 小时后过期且带密码**；在页面上点 `Claim this site` 用 GitHub 登录认领后，还要在
+`Project configuration → General → Visitor access` 里把可见性从「私人的」改为「民众（Public）」，否则会返回 401。
 
 ### 访问不了怎么办（国内网络）
 
-`github.io` 在国内属于"时通时不通"（走 Fastly CDN，DNS 容易被污染）。实测全球多数节点返回 200，但**香港节点出现 `Connection refused`**，说明国内访问不稳定。可选办法：
+1. 换另一条链接（Pages ↔ Netlify），或换时间/换网络重试（多为间歇性）。
+2. 用仓库里的源码本地打开：`index.html` 单文件，双击即可玩。
+3. 部署到国内可访问的服务，例如 Gitee Pages（需实名认证）。
 
-1. 换个时间或换个网络重试（很多时候是间歇性的）。
-2. 直接用 GitHub 上的源码在本地打开（`index.html` 单文件，双击即可玩）。
-3. 部署到国内更通的服务（如 Netlify / Vercel），拿到 `*.netlify.app` 链接分享。
-
-注意：`cdn.jsdelivr.net`、`raw.githubusercontent.com` 返回的是 `text/plain`，**不能当游戏链接**（浏览器只会显示源码）。
+注意：`cdn.jsdelivr.net`、`raw.githubusercontent.com` 返回 `text/plain`，**不能当游戏链接**（浏览器只会显示源码）。
 
 ## 文件
 
 - `index.html` —— 游戏本体（HTML + Canvas + WebAudio，单文件，含触屏操作）
 - `serve.js` —— 本地预览用极简静态服务器（默认监听所有网卡，手机同 WiFi 可访问）
 - `deploy.js` —— 一键发布到 GitHub（建仓库 + 推送 + 开 Pages）
+- `netlify-deploy.js` / `netlify-site.zip` —— 发布到 Netlify Drop
+- `gh-make-token.js` / `gh-web.js` / `gh-create-repo.js` —— 借浏览器登录态自动完成 GitHub 建仓/发 token
 - `cdp-test.js` —— 键盘/鼠标自动化行为测试
 - `cdp-mobile-test.js` —— 手机触屏仿真测试
 - `cdp-live-test.js` —— 线上网址端到端验收
 - `tools/crop-shots.py` —— 截图自动裁边工具
-- `shots/` —— 各状态截图（含手机竖屏/横屏）
+- `shots/` —— 各状态截图（含手机竖屏/横屏与线上实拍）
