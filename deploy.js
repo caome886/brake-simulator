@@ -136,8 +136,11 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
   }
 
   // 3. 逐个文件写进仓库（Contents API：已存在则带 sha 更新）
+  // 保险：即使有人误把凭据文件写进 FILES，也坚决不推送
+  const FORBIDDEN = /(^|\/)(gh-token\.txt|\.netrc|\.git-credentials|hosts\.yml|netlify-url\.txt)$/i;
   let pushed = 0, skipped = 0;
   for (const rel of FILES) {
+    if (FORBIDDEN.test(rel)) { console.log('✗ 拒绝上传凭据文件：' + rel); process.exit(6); }
     const abs = path.join(ROOT, rel.split('/').join(path.sep));
     if (!fs.existsSync(abs)) { console.log('• 跳过（本地没有）：' + rel); skipped++; continue; }
     const content = fs.readFileSync(abs).toString('base64');
