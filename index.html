@@ -1,0 +1,1311 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#0d0f13">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' rx='3' fill='%23e0483f'/><rect x='6' y='3' width='4' height='10' rx='1' fill='%23fff'/></svg>">
+<title>刹车模拟器</title>
+<style>
+  html,body{margin:0;height:100%;background:#0d0f13;overflow:hidden;overscroll-behavior:none;
+    -webkit-text-size-adjust:100%;-webkit-tap-highlight-color:transparent;
+    -webkit-user-select:none;user-select:none;font-family:system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;}
+  #wrap{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;
+    box-sizing:border-box;padding-bottom:var(--pad-b,0px);}
+  #stage{position:relative;}
+  canvas{display:block;border-radius:14px;box-shadow:0 18px 60px rgba(0,0,0,.6);cursor:default;
+    touch-action:none;-webkit-user-select:none;user-select:none;}
+
+  /* ---------- 手机触屏操作按钮（固定在屏幕底部，不遮挡画面，静止一会儿自动隐藏） ---------- */
+  /* 整条按钮栏必须 pointer-events:none，只有按钮本身接收触摸，
+     否则这条透明栏会把画面下沿的点击/触摸全部吃掉（比如失败界面的「重试」按钮）。 */
+  body.touch #touchbar{opacity:1;}
+  #touchbar{position:fixed;left:0;right:0;bottom:0;z-index:3;opacity:0;
+    pointer-events:none;transition:opacity .32s ease;display:grid;grid-template-columns:1fr 1fr;gap:12px;
+    padding:8px 10px calc(8px + env(safe-area-inset-bottom, 0px));
+    box-sizing:border-box;background:linear-gradient(transparent,rgba(6,8,12,.86) 42%);}
+  body.touch #touchbar .pad{pointer-events:auto;}
+  .pad{position:relative;height:clamp(74px,17vh,110px);border:none;border-radius:17px;
+    font-family:inherit;font-size:clamp(17px,4.7vw,23px);font-weight:800;letter-spacing:1px;
+    color:#ecf3fa;cursor:pointer;touch-action:none;-webkit-tap-highlight-color:transparent;
+    box-shadow:0 7px 0 rgba(0,0,0,.42),inset 0 1px 0 rgba(255,255,255,.30);
+    transition:transform .05s ease,box-shadow .05s ease,filter .05s ease;}
+  .pad span{position:absolute;left:0;right:0;bottom:7px;font-size:10.5px;font-weight:600;
+    letter-spacing:0;opacity:.62;pointer-events:none;}
+  .pad.down{transform:translateY(5px);box-shadow:0 2px 0 rgba(0,0,0,.42),inset 0 1px 0 rgba(255,255,255,.22);
+    filter:brightness(1.22) saturate(1.1);}
+  #bg{background:linear-gradient(180deg,#4fe0a0,#17a86f);}
+  #bb{background:linear-gradient(180deg,#ff6d5c,#cf2b1d);}
+  #toggle{position:fixed;right:10px;bottom:calc(14px + env(safe-area-inset-bottom, 0px));
+    display:none;z-index:4;padding:9px 15px;border-radius:999px;border:1px solid rgba(255,255,255,.30);
+    background:rgba(10,13,18,.74);color:#dce6f2;font-family:inherit;font-size:12.5px;font-weight:700;
+    cursor:pointer;touch-action:manipulation;-webkit-tap-highlight-color:transparent;}
+  body.touch #toggle{display:block;}
+</style>
+</head>
+<body>
+<div id="wrap"><div id="stage"><canvas id="cv"></canvas><div id="touchbar">
+  <button class="pad" id="bg" type="button">加速<span>按住不放</span></button>
+  <button class="pad" id="bb" type="button">刹车<span>按住不放 · 超过 1600N 会踩断</span></button>
+</div><button id="toggle" type="button">操作</button></div></div>
+<script>
+(() => {
+'use strict';
+
+// ---------- canvas / layout ----------
+const W = 960, H = 560;
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+const stage = document.getElementById('stage');
+// 触屏设备（手机/平板）显示屏幕按钮；桌面端保持键盘 + 鼠标不变。
+// 判断依据用 pointer:coarse（真机触摸屏为 coarse，桌面鼠标为 fine）——
+// 不能只看 navigator.maxTouchPoints：Chrome 在桌面/无头环境下也可能报 > 0。
+const mqCoarse = window.matchMedia ? window.matchMedia('(pointer: coarse)') : null;
+const mqFine   = window.matchMedia ? window.matchMedia('(pointer: fine)') : null;
+const IS_TOUCH = !!(mqCoarse && mqCoarse.matches) ||
+  (!!(navigator.maxTouchPoints > 0 || 'ontouchstart' in window) && !(mqFine && mqFine.matches));
+if (IS_TOUCH) document.body.classList.add('touch');
+
+// 按钮栏高度：与 CSS 里 .pad 的高度公式保持一致（clamp(74px, 17vh, 110px) + 内边距 16px）。
+// 不用 offsetHeight / 100vh：旋转屏幕后它们可能还是旧朝向的值，会导致画面和按钮栏重叠。
+const vh = () => Math.round((window.visualViewport && window.visualViewport.height) || window.innerHeight);
+function touchBarH(){
+  if (!IS_TOUCH) return 0;
+  const pad = Math.min(110, Math.max(74, Math.round(vh() * 0.17)));
+  return Math.min(pad + 16, Math.round(vh() * 0.34));   // 保证画面至少还有约 66% 高度
+}
+function resize(){
+  const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+  const H_VIEW = vh();
+  const portraitPhone = IS_TOUCH && H_VIEW > window.innerWidth;
+  const barH = touchBarH();
+  // 画面排在按钮栏上方，并留出底部安全区（刘海屏手势条）与一条缝隙
+  const safeB = IS_TOUCH ? Math.min(48, Math.max(10, Math.round(H_VIEW * 0.05))) : 0;
+  const availW = window.innerWidth * (IS_TOUCH ? 0.92 : 1) * (portraitPhone ? 1 : 0.995);
+  const availH = Math.max(80, H_VIEW - barH - safeB);
+  // 让 flex 居中把按钮栏的空间也算进去，否则画面会被往下挤、压到按钮栏上
+  document.getElementById('wrap').style.setProperty('--pad-b', (barH + safeB) + 'px');
+  const s = Math.min(availW / W, availH / H);
+  const cw = Math.max(1, Math.floor(W * s)), ch = Math.max(1, Math.floor(H * s));
+  stage.style.width  = cw + 'px';
+  stage.style.height = ch + 'px';
+  cv.style.width  = cw + 'px';
+  cv.style.height = ch + 'px';
+  cv.width  = Math.round(cw * dpr);
+  cv.height = Math.round(ch * dpr);
+  ctx.setTransform(cv.width / W, 0, 0, cv.height / H, 0, 0);
+}
+// 旋转屏幕/浏览器地址栏收缩时，尺寸变化会分几次到达，所以延迟多排几次版
+let resizeTimers = [];
+function scheduleResize(){
+  resize();
+  resizeTimers.forEach(clearTimeout);
+  resizeTimers = [120, 400, 800].map(ms => setTimeout(resize, ms));
+}
+window.addEventListener('resize', scheduleResize);
+window.addEventListener('orientationchange', scheduleResize);
+if (window.visualViewport) {
+  window.visualViewport.addEventListener('resize', scheduleResize);
+  window.visualViewport.addEventListener('scroll', scheduleResize);
+}
+scheduleResize();
+
+// ---------- constants ----------
+const ROAD_W = 580;            // 上帝视角区域宽度
+const CAB_X  = ROAD_W;         // 座舱区域起点
+const BREAK_FORCE = 1600;      // 断裂阈值(N)
+const MAX_SPEED   = 240;       // km/h
+const TUNE = { accel: 24, brakeDecel: 30, drag: 1.1, forceRate: 820, forceRelease: 3400 };
+
+// ---------- 脚踏视角几何常量（侧视：脚跟踩地、前脚掌压踏板） ----------
+const D2R = Math.PI / 180;
+const PED_PIVOT = { x: CAB_X + 84, y: 118 };   // 踏板转轴（仪表台下方）
+const PED_LEN   = 150;                          // 转轴到踏板面中心
+const PED_REST  = 12 * D2R;                     // 未踩时的悬垂角
+const PED_MAX   = 19.5 * D2R;                   // 踩到底(1600N)时的角度
+const ARM_SNAP  = 0.42;                         // 断裂位置（沿臂比例）
+const FLOOR_A   = { x: 604, y: 396 };           // 地板线（靠防火墙一端）
+const FLOOR_B   = { x: 960, y: 418 };           // 地板线（靠座椅一端）
+const ANKLE_OFF = { x: 64, y: -30 };            // 脚踝相对脚跟（踝在脚跟后上方）
+const HEEL_REST = { x: 775, y: 350 };           // 脚跟静止位置（踩地）
+
+// ---------- state ----------
+const S = {
+  phase: 'drive',       // drive | failed
+  speed: 0,
+  force: 0,
+  gas: false, brake: false,
+  pedal: 'up',          // up | pressed
+  pedAng: 0,            // 当前踏板倾角(rad)
+  broken: false,
+  breakT: 0,            // 断裂动画计时(段)
+  failT: 0,             // 失败界面计时(秒)
+  dist: 0,
+  wobble: 0,
+  flash: 0,
+  shake: 0,
+  ground: 0,
+  holding: false,       // 松刹车时脚是否仍悬在踏板上
+  idle: 0,              // 无操作计时(用于开局提示)
+  frags: [],
+  sparks: [],
+  hover: false
+};
+
+function reset(){
+  S.phase='drive'; S.speed=0; S.force=0; S.gas=false; S.brake=false;
+  S.pedal='up'; S.pedAng=0; S.broken=false; S.breakT=0; S.failT=0;
+  S.dist=0; S.wobble=0; S.flash=0; S.shake=0; S.holding=false; S.idle=0;
+  S.frags=[]; S.sparks=[];
+  cv.style.cursor = 'default';
+  RESETS++;
+}
+let RESETS = 0, TRANS = 0;
+// 调试/演示参数（仅用于预览与截图：?force=1200&s=F700&go=1）
+// 同时兼容 #/ 形式（?force=… 与 #force=… 等价），便于在会丢弃 query 的托管/CDN 上使用：
+//   .../index.html?force=1200   ·   .../index.html#force=1200
+const Q = new URLSearchParams([...new URLSearchParams(location.search), ...new URLSearchParams(location.hash.replace(/^#\/?/, ''))]);
+const BREAK_PREVIEW = Q.get('anim') === 'break';
+let FROZEN = !BREAK_PREVIEW && (Q.has('force') || Q.has('speed') || Q.get('s') === 'F700' || Q.has('go'));
+if (Q.has('force')) { S.force = Math.max(0, Math.min(BREAK_FORCE, parseFloat(Q.get('force')) || 0)); }
+if (Q.has('speed')) S.speed = Math.max(0, parseFloat(Q.get('speed')) || 0);
+if (Q.has('s') === false && Q.get('force')) S.pedal = 'pressed';
+if (Q.get('s') === 'F700') {
+  S.force = BREAK_FORCE; S.broken = true; S.breakT = 1; S.failT = 999;
+  S.pedal = 'up'; S.pedAng = 0; S._toeT = 1;
+  spawnFrags();
+}
+if (BREAK_PREVIEW) {   // 预览断裂动画（不是静帧）
+  S.force = BREAK_FORCE - 40; S.pedal = 'pressed'; S.pedAng = 23 * Math.PI / 180; S._toeT = 1;
+}
+if (Q.has('go')) { S.broken = true; S.breakT = 1; S.phase = 'failed'; S.failT = parseFloat(Q.get('go')) || 2; S.force = BREAK_FORCE; S.pedAng = 24 * Math.PI / 180; S._toeT = 1; }
+
+// ---------- input ----------
+const keys = {};
+window.addEventListener('keydown', e => {
+  if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Space'].includes(e.code)) e.preventDefault();
+  keys[e.code] = true;
+  if (e.code === 'KeyR') { reset(); }
+});
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+window.addEventListener('blur', () => { for (const k in keys) keys[k] = false; touch.gas = touch.brake = false; });
+
+const BTN = { x: W/2 - 96, y: 396, w: 192, h: 54 };
+function toCanvas(ev){
+  const r = cv.getBoundingClientRect();
+  return { x: (ev.clientX - r.left) * (W / r.width), y: (ev.clientY - r.top) * (H / r.height) };
+}
+function inBtn(p){ return p.x > BTN.x && p.x < BTN.x + BTN.w && p.y > BTN.y && p.y < BTN.y + BTN.h; }
+// 坐标换算：优先用 offsetX / offsetY（相对元素、CSS 像素），
+// 它不受 DPR、页面缩放、移动端视口换算的影响；clientX 在某些移动场景下会被设备像素比放大。
+function toCanvas(ev){
+  const r = cv.getBoundingClientRect();
+  const ox = (typeof ev.offsetX === 'number') ? ev.offsetX : (ev.clientX - r.left);
+  const oy = (typeof ev.offsetY === 'number') ? ev.offsetY : (ev.clientY - r.top);
+  return { x: ox * (W / r.width), y: oy * (H / r.height) };
+}
+function inBtn(p){ return p.x > BTN.x && p.x < BTN.x + BTN.w && p.y > BTN.y && p.y < BTN.y + BTN.h; }
+function setHover(on){ S.hover = on; cv.style.cursor = on ? 'pointer' : 'default'; }
+
+// 鼠标 + 触屏 + 多点触控统一走 Pointer Events：
+// 一个手指按加速、另一个手指按刹车都能同时生效；触屏时画面按「上/下半屏」分油门刹车。
+const touch = { gas: false, brake: false };
+const cvPtrs = new Map();          // pointerId → 'gas' | 'brake'
+function touchSteerFromPoint(p){ return (p.y < H * 0.62) ? 'gas' : 'brake'; }
+
+function ptrBegin(ev){
+  const p = toCanvas(ev);
+  const isTouch = ev.pointerType && ev.pointerType !== 'mouse';
+  if (S.phase === 'failed' && S.failT > 0.55 && inBtn(p)) { reset(); setHover(false); return; }
+  if (isTouch) {
+    if (S.phase === 'drive') {
+      const side = touchSteerFromPoint(p);
+      cvPtrs.set(ev.pointerId, side);
+      setTouch(side, true);
+      try { cv.setPointerCapture(ev.pointerId); } catch (e) {}
+    } else {
+      showTouchBar();
+    }
+    return;
+  }
+  // 鼠标也能开车：左键加速、右键/中键刹车
+  if (S.phase === 'drive') {
+    if (ev.button === 0) keys['Mouse0'] = true;
+    if (ev.button === 2) keys['Mouse2'] = true;
+  }
+  if (ev.button === 2) ev.preventDefault();
+}
+function ptrEnd(ev){
+  const side = cvPtrs.get(ev.pointerId);
+  if (side) { cvPtrs.delete(ev.pointerId); setTouch(side, false); }
+  if (!ev.pointerType || ev.pointerType === 'mouse') { keys['Mouse0'] = false; keys['Mouse2'] = false; }
+}
+if (window.PointerEvent) {
+  cv.addEventListener('pointerdown', ptrBegin);
+  cv.addEventListener('pointerup', ptrEnd);
+  cv.addEventListener('pointercancel', ptrEnd);
+  cv.addEventListener('pointermove', ev => {
+    if (!ev.pointerType || ev.pointerType === 'mouse')
+      setHover(S.phase === 'failed' && S.failT > 0.55 && inBtn(toCanvas(ev)));
+  });
+} else {
+  // 兜底：极老的浏览器
+  cv.addEventListener('mousedown', ptrBegin);
+  window.addEventListener('mouseup', ptrEnd);
+  cv.addEventListener('touchstart', ev => {
+    ev.preventDefault();
+    const t = ev.changedTouches[0];
+    ptrBegin({ pointerId: t.identifier, pointerType: 'touch', clientX: t.clientX, clientY: t.clientY });
+  }, { passive: false });
+  cv.addEventListener('touchend', ev => {
+    ev.preventDefault();
+    for (const t of ev.changedTouches) ptrEnd({ pointerId: t.identifier, pointerType: 'touch' });
+  }, { passive: false });
+}
+window.addEventListener('contextmenu', e => { if (e.target === cv) e.preventDefault(); });
+
+// ---------- 手机触屏操作按钮：左右两个大按钮，各自独立、可以同时按 ----------
+let barHideAt = performance.now() + 4200;      // 静止一会儿后自动隐藏按钮，露出完整画面
+const touchbar = document.getElementById('touchbar');
+const toggleBtn = document.getElementById('toggle');
+const padEls = { gas: document.getElementById('bg'), brake: document.getElementById('bb') };
+const padKey = { gas: 'TouchGas', brake: 'TouchBrake' };
+
+function showTouchBar(){
+  barHideAt = performance.now() + 4200;
+  if (document.body.classList.contains('touch')) return;
+  document.body.classList.add('touch');
+  resize();                       // 按钮栏出现/消失会改变可用高度，画面重新排版
+}
+function hideTouchBar(){
+  if (!document.body.classList.contains('touch')) return;
+  document.body.classList.remove('touch');
+  resize();
+}
+function setTouch(which, on){
+  touch[which] = on;
+  keys[padKey[which]] = on;
+  if (padEls[which]) padEls[which].classList.toggle('down', on);
+  if (on) { showTouchBar(); audioInit(); }
+}
+for (const which of ['gas', 'brake']) {
+  const el = padEls[which];
+  if (!el) continue;
+  el.addEventListener('pointerdown', ev => {
+    ev.preventDefault();
+    try { el.setPointerCapture(ev.pointerId); } catch (e) {}
+    setTouch(which, true);
+  });
+  const off = ev => { ev.preventDefault(); setTouch(which, false); };
+  el.addEventListener('pointerup', off);
+  el.addEventListener('pointercancel', off);
+  el.addEventListener('lostpointercapture', off);
+  el.addEventListener('contextmenu', e => e.preventDefault());
+}
+// 键盘操作时也把按钮点亮，方便对照（按钮的显示/隐藏只在 frame 里管理）
+function syncPadVisual(){
+  if (!padEls.gas) return;
+  const g = !!(keys['Space'] || keys['ArrowUp'] || keys['KeyW'] || keys['Mouse0'] || touch.gas);
+  const b = !!(keys['ArrowDown'] || keys['KeyS'] || keys['Mouse2'] || touch.brake);
+  padEls.gas.classList.toggle('down', g);
+  padEls.brake.classList.toggle('down', b);
+}
+if (toggleBtn) toggleBtn.addEventListener('click', () => {
+  if (document.body.classList.contains('touch')) hideTouchBar(); else showTouchBar();
+});
+// 画面上直接按也能玩（无需依赖底部按钮）；失败界面的「重试」按钮在任何情况下都可点。见 ptrBegin。
+
+// ---------- audio (轻量合成音, 首次交互后启用) ----------
+let AC = null, engineGain = null, engineOsc = null, squealGain = null, beepT = 0;
+function audioInit(){
+  if (AC) { if (AC.state === 'suspended') AC.resume(); return; }
+  const C = window.AudioContext || window.webkitAudioContext;
+  if (!C) return;
+  AC = new C();
+  // 引擎
+  engineOsc = AC.createOscillator(); engineOsc.type = 'sawtooth'; engineOsc.frequency.value = 60;
+  const lp = AC.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 420;
+  engineGain = AC.createGain(); engineGain.gain.value = 0;
+  engineOsc.connect(lp).connect(engineGain).connect(AC.destination); engineOsc.start();
+  // 刹车尖叫
+  const sq = AC.createOscillator(); sq.type = 'triangle'; sq.frequency.value = 1180;
+  squealGain = AC.createGain(); squealGain.gain.value = 0;
+  sq.connect(squealGain).connect(AC.destination); sq.start();
+}
+function blip(freq, dur, vol, type){
+  if (!AC) return;
+  const o = AC.createOscillator(), g = AC.createGain();
+  o.type = type || 'square'; o.frequency.value = freq;
+  g.gain.setValueAtTime(0, AC.currentTime);
+  g.gain.linearRampToValueAtTime(vol, AC.currentTime + 0.01);
+  g.gain.exponentialRampToValueAtTime(0.0001, AC.currentTime + dur);
+  o.connect(g).connect(AC.destination); o.start(); o.stop(AC.currentTime + dur + 0.02);
+}
+function crashSound(){
+  if (!AC) return;
+  const len = 0.35, buf = AC.createBuffer(1, AC.sampleRate * len, AC.sampleRate);
+  const d = buf.getChannelData(0);
+  for (let i = 0; i < d.length; i++) d[i] = (Math.random()*2-1) * Math.pow(1 - i/d.length, 2.6);
+  const src = AC.createBufferSource(); src.buffer = buf;
+  const bp = AC.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 900; bp.Q.value = 0.8;
+  const g = AC.createGain(); g.gain.value = 0.5;
+  src.connect(bp).connect(g).connect(AC.destination); src.start();
+}
+
+// ---------- update ----------
+function update(dt){
+  if (FROZEN) return;          // 预览/截图模式：画面静止
+  // 预览断裂动画时，把受力钉在阈值上，让断裂流程自然跑一遍
+  if (BREAK_PREVIEW && !S.broken) S.force = BREAK_FORCE - 5;
+  const drive = S.phase === 'drive';
+  const kGas   = !!(keys['Space'] || keys['ArrowUp'] || keys['KeyW'] || keys['Mouse0'] || touch.gas);
+  const kBrake = !!(keys['ArrowDown'] || keys['KeyS'] || keys['Mouse2'] || touch.brake);
+  S.gas   = drive && kGas;
+  S.brake = drive && kBrake;
+
+  // --- 车速 ---
+  if (S.gas) S.speed += TUNE.accel * dt;
+  S.speed -= TUNE.drag * dt;                                  // 空气/滚阻
+  if (S.brake) S.speed -= TUNE.brakeDecel * dt * (0.5 + 0.5 * Math.min(1, S.force / 400));
+  if (S.speed < 0) S.speed = 0;
+  if (S.speed > MAX_SPEED) S.speed = MAX_SPEED;
+  S.dist += S.speed / 3.6 * dt;
+
+  // --- 脚 / 踏板 ---
+  // 只有按住刹车键才在踩：松开立刻停止施加刹车力
+  const pressing = drive && S.brake;
+  S.holding = pressing;
+  S.pedal = pressing && !S.broken ? 'pressed' : 'up';
+
+  if (pressing) {
+    // 踩得越久 → 踏板受力越大
+    S.force += TUNE.forceRate * dt * (1 + 0.45 * Math.min(1, S.force / BREAK_FORCE));
+    if (S.force >= BREAK_FORCE) {
+      S.force = BREAK_FORCE;
+      if (!S.broken) triggerBreak();
+    }
+  } else {
+    S.force -= TUNE.forceRelease * dt;      // 松脚 → 立刻卸力
+    if (S.force < 0) S.force = 0;
+  }
+
+  // --- 踏板角度 / 抖动 ---
+  const r = S.force / BREAK_FORCE;
+  const targetAng = PED_REST + (PED_MAX - PED_REST) * (pressing ? r : 0);
+  S.pedAng += (targetAng - S.pedAng) * Math.min(1, dt * 16);
+  S.wobble = r > 0.72 ? r : 0;
+
+  // --- 能量反馈 ---
+  S.flash = Math.max(0, S.flash - dt * 2.2);
+  S.shake = Math.max(0, S.shake - dt * 2.6);
+  const danger = r > 0.8;
+  if (AC) {
+    engineGain.gain.value = S.gas ? 0.045 : 0.018;
+    engineOsc.frequency.value = 52 + S.speed * 1.5;
+    squealGain.gain.value = (S.brake && S.speed > 24) ? Math.min(0.05, S.speed / 6000) : 0;
+  }
+  if (danger && drive) {
+    beepT -= dt;
+    if (beepT <= 0) { beepT = 0.16; blip(1250, 0.06, 0.055); }
+  }
+
+  // --- 断裂后 ---
+  if (S.broken) {
+    S.breakT += dt;
+    for (const f of S.frags) {
+      if (f.rest) continue;
+      f.vy += 1500 * dt; f.x += f.vx * dt; f.y += f.vy * dt; f.a += f.va * dt;
+      // 落到地板上（地板是斜的）
+      const fy = FLOOR_A.y + (f.x - FLOOR_A.x) / (FLOOR_B.x - FLOOR_A.x) * (FLOOR_B.y - FLOOR_A.y) - 6;
+      if (f.y > fy) {
+        f.y = fy; f.vy *= -0.32; f.vx *= 0.55; f.va *= 0.45;
+        if (Math.abs(f.vy) < 60) { f.vy = 0; f.vx = 0; f.va = 0; f.rest = true; }
+      }
+    }
+    for (const sp of S.sparks) {
+      sp.vy += 900 * dt; sp.x += sp.vx * dt; sp.y += sp.vy * dt; sp.life -= dt;
+    }
+    S.sparks = S.sparks.filter(s => s.life > 0);
+    if (S.breakT > 0.35 && S.phase === 'drive') { S.phase = 'failed'; S.failT = 0; TRANS++; }
+  }
+  if (S.phase === 'failed') S.failT += dt;
+
+  // --- 场景滚动 ---
+  S.ground = (S.ground + S.speed * dt * 2.2) % 1000;
+  S.idle = (kGas || kBrake) ? 0 : S.idle + dt;
+}
+
+function spawnFrags(){
+  const h = pedalHinge(), ang = S.pedAng;
+  const dir = { x: -Math.sin(ang), y: Math.cos(ang) };   // 沿臂方向（向下偏前）
+  const n   = { x:  Math.cos(ang), y: Math.sin(ang) };   // 踏板面法线（朝脚）
+  // 断裂点以下：踏板面 ＋ 下半截臂 一起掉落；断口附近再崩两块小碎片
+  S.frags.push({
+    x: h.x + dir.x * PED_LEN * 0.74 - n.x * 4, y: h.y + dir.y * PED_LEN * 0.74 - n.y * 4,
+    w: 62, h: 20, a: ang - Math.PI / 2, va: 3.2, vx: 96, vy: -110,
+    pad: true, rest: false
+  });
+  const chips = [
+    { t: 0.50, w: 26, h: 12, ax: 1, vx: -150, vy: -250 },
+    { t: 0.62, w: 20, h: 10, ax: -1, vx: -40, vy: -300 },
+    { t: 0.44, w: 16, h: 9, ax: 1, vx: 120, vy: -200 }
+  ];
+  for (const c of chips) {
+    S.frags.push({
+      x: h.x + dir.x * PED_LEN * c.t + n.x * 3 * c.ax,
+      y: h.y + dir.y * PED_LEN * c.t + n.y * 3 * c.ax,
+      w: c.w, h: c.h, a: ang, va: (Math.random() - 0.5) * 11,
+      vx: c.vx + (Math.random() - 0.5) * 70, vy: c.vy, rest: false
+    });
+  }
+}
+
+function triggerBreak(){
+  S.broken = true;
+  S.breakT = 0;
+  S.shake = 1;
+  S.flash = 1;
+  crashSound();
+  spawnFrags();
+  const h = pedalHinge();
+  const dir = { x: -Math.sin(S.pedAng), y: Math.cos(S.pedAng) };
+  const bx = h.x + dir.x * PED_LEN * ARM_SNAP, by = h.y + dir.y * PED_LEN * ARM_SNAP;
+  for (let i = 0; i < 30; i++) {
+    const a = Math.random() * Math.PI * 2, sp = 70 + Math.random() * 340;
+    S.sparks.push({
+      x: bx, y: by,
+      vx: Math.cos(a) * sp, vy: Math.sin(a) * sp - 140,
+      life: 0.35 + Math.random() * 0.5, max: 0.85
+    });
+  }
+}
+
+// ---------- geometry ----------
+function pedalHinge(){ return PED_PIVOT; }
+function pedalDir(a){
+  const ang = (a === undefined) ? S.pedAng : a;
+  return { x: -Math.sin(ang), y: Math.cos(ang) };
+}
+function pedalPadCenter(a){
+  const h = pedalHinge(), d = pedalDir(a);
+  return { x: h.x + d.x * PED_LEN, y: h.y + d.y * PED_LEN };
+}
+// 断裂后仅剩的一小截臂
+function pedalStub(){
+  const h = pedalHinge(), d = pedalDir();
+  return { x: h.x + d.x * PED_LEN * ARM_SNAP, y: h.y + d.y * PED_LEN * ARM_SNAP };
+}
+// 前脚掌与踏板的接触点（未踩时抬起）
+const FOOT = { len: 132, toeLocal: { x: 117, y: -2 } };   // 鞋长 / 鞋尖在鞋局部坐标
+function footRig(){
+  const p = pedalPadCenter();
+  const d = pedalDir();
+  const n = { x: -d.y, y: d.x };             // 指向脚（后上方）
+  const restPad = pedalPadCenter(PED_REST);
+  const contact = { x: p.x + n.x * 14, y: p.y + n.y * 14 };
+  const padOff = { x: p.x - restPad.x, y: p.y - restPad.y };
+  const heel = { x: HEEL_REST.x, y: HEEL_REST.y };
+  const rv = (v, ang) => ({ x: v.x * Math.cos(ang) - v.y * Math.sin(ang), y: v.x * Math.sin(ang) + v.y * Math.cos(ang) });
+
+  const pressing = S.pedal === 'pressed';
+  const t = pressing ? 1 : 0;
+  S._toeT = S._toeT === undefined ? t : S._toeT + (t - S._toeT) * 0.4;
+  const k = S._toeT;
+
+  // 未踩：脚尖沿踏板面法线抬起一点，脚的角度保持自然
+  const lift = 1 - k;
+  const toe = { x: contact.x, y: contact.y };
+  toe.x += (n.x * 16 - 4) * lift + padOff.x * k;
+  toe.y += (n.y * 16 + 10) * lift + padOff.y * k;
+
+  // 鞋尖在接触点 ⇒ 球点(前脚掌)沿足轴后移一个鞋长
+  const footAng = Math.atan2(toe.y - heel.y, toe.x - heel.x);
+  const ball = { x: toe.x - Math.cos(footAng) * FOOT.len, y: toe.y - Math.sin(footAng) * FOOT.len };
+  const ankleRel = rv(ANKLE_OFF, footAng - 0.12);
+  const ankle = { x: heel.x + ankleRel.x, y: heel.y + ankleRel.y };
+  ankle.x += padOff.x * 0.6 * k; ankle.y += padOff.y * 0.6 * k;
+
+  if (S.broken) {                              // 踏板断了：脚踩空、垂向地面
+    const sink = Math.min(1, S.breakT / 0.22);
+    toe.x += 16 * sink; toe.y += 60 * sink;
+    ball.x += 14 * sink; ball.y += 52 * sink;
+    ankle.x += 8 * sink; ankle.y += 18 * sink;
+  }
+  return { toe, ball, heel, ankle, contact, pad: p, padOff, k, lift, footAng, broken: S.broken };
+}
+
+// ================= rendering =================
+function roundRect(x, y, w, h, r){
+  ctx.beginPath();
+  if (ctx.roundRect) ctx.roundRect(x, y, w, h, r);
+  else {
+    const rr = Math.min(r, w/2, h/2);
+    ctx.moveTo(x+rr, y); ctx.arcTo(x+w, y, x+w, y+h, rr); ctx.arcTo(x+w, y+h, x, y+h, rr);
+    ctx.arcTo(x, y+h, x, y, rr); ctx.arcTo(x, y, x+w, y, rr); ctx.closePath();
+  }
+}
+function shadow(c, blur, oy){ ctx.shadowColor = c; ctx.shadowBlur = blur; ctx.shadowOffsetY = oy || 0; }
+function noShadow(){ ctx.shadowColor = 'transparent'; ctx.shadowBlur = 0; ctx.shadowOffsetY = 0; }
+
+function draw(){
+  ctx.save();
+  ctx.clearRect(0, 0, W, H);
+  // 断裂时屏幕震动
+  if (S.shake > 0.01) {
+    const m = S.shake * 9;
+    ctx.translate((Math.random()-0.5)*m, (Math.random()-0.5)*m);
+  }
+  drawRoad();
+  drawCar();
+  drawCabin();
+  ctx.restore();
+  drawHUD();
+  drawFx();
+  if (S.phase === 'failed') drawFail();
+}
+
+// --- 上帝视角路面 ---
+function drawRoad(){
+  // 草地
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, '#1c2a20'); g.addColorStop(1, '#141d17');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, ROAD_W, H);
+
+  // 路面
+  const rx = 60, rw = ROAD_W - 120;
+  ctx.fillStyle = '#33363d'; ctx.fillRect(rx, 0, rw, H);
+  ctx.fillStyle = 'rgba(255,255,255,.035)';
+  ctx.fillRect(rx, 0, 8, H); ctx.fillRect(rx + rw - 8, 0, 8, H);
+
+  // 边线
+  ctx.fillStyle = '#e9edf2';
+  ctx.fillRect(rx + 10, 0, 5, H); ctx.fillRect(rx + rw - 15, 0, 5, H);
+
+  // 屏内 vs 屏外：道路标线（因为车固定不动，标线/电线杆向后滚动 = 车在前进）
+  const cx = rx + rw / 2, off = S.ground % 160;
+  ctx.fillStyle = '#f2f4f6';
+  for (let y = -160 + off; y < H; y += 160) ctx.fillRect(cx - 4, y, 8, 84);
+  // 车道分割
+  ctx.fillStyle = 'rgba(240,243,246,.5)';
+  for (let y = -160 + (off * 1.0 % 160); y < H; y += 160) {
+    ctx.fillRect(cx - rw/4 - 3, y, 6, 60);
+    ctx.fillRect(cx + rw/4 - 3, y, 6, 60);
+  }
+  // 路灯/树影
+  const o2 = S.ground % 260;
+  for (let y = -260 + o2; y < H + 60; y += 260) {
+    ctx.fillStyle = '#20301f';
+    ctx.beginPath(); ctx.arc(rx - 34, y, 26, 0, 7); ctx.fill();
+    ctx.beginPath(); ctx.arc(rx + rw + 34, y + 120, 30, 0, 7); ctx.fill();
+    ctx.fillStyle = 'rgba(255,214,140,.10)';
+    ctx.beginPath(); ctx.arc(rx - 34, y, 46, 0, 7); ctx.fill();
+  }
+
+  // 区域标签
+  ctx.fillStyle = 'rgba(255,255,255,.30)';
+  ctx.font = '600 12px ui-monospace,Consolas,monospace';
+  ctx.fillText('上帝视角 / TOP-DOWN', 16, 24);
+  ctx.fillText('上帝视角 · 路面以 ' + Math.round(S.speed) + ' km/h 后退', 16, 214);
+
+  // 分隔线
+  ctx.fillStyle = 'rgba(255,255,255,.10)'; ctx.fillRect(ROAD_W - 1, 0, 1, H);
+}
+
+// --- 车辆 ---
+function drawCar(){
+  const cx = ROAD_W / 2, cy = 300;
+  ctx.save();
+  // 车底阴影
+  shadow('rgba(0,0,0,.5)', 26, 12);
+  ctx.fillStyle = 'rgba(0,0,0,.35)';
+  roundRect(cx - 44, cy - 74, 88, 148, 20); ctx.fill();
+  noShadow();
+
+  // 车轮
+  ctx.fillStyle = '#15171b';
+  roundRect(cx - 55, cy - 52, 16, 34, 6); ctx.fill();
+  roundRect(cx + 39, cy - 52, 16, 34, 6); ctx.fill();
+  roundRect(cx - 55, cy + 20, 16, 34, 6); ctx.fill();
+  roundRect(cx + 39, cy + 20, 16, 34, 6); ctx.fill();
+
+  // 车身
+  const bg = ctx.createLinearGradient(cx - 44, 0, cx + 44, 0);
+  bg.addColorStop(0, '#c8323c'); bg.addColorStop(0.42, '#f0555f'); bg.addColorStop(1, '#a92230');
+  ctx.fillStyle = bg;
+  roundRect(cx - 44, cy - 74, 88, 148, 22); ctx.fill();
+
+  // 前挡风/后窗
+  ctx.fillStyle = 'rgba(24,30,42,.92)';
+  roundRect(cx - 32, cy - 60, 64, 30, 10); ctx.fill();
+  roundRect(cx - 30, cy + 34, 60, 26, 10); ctx.fill();
+  // 车顶
+  ctx.fillStyle = 'rgba(255,255,255,.10)';
+  roundRect(cx - 33, cy - 24, 66, 50, 12); ctx.fill();
+  // 后视镜
+  ctx.fillStyle = '#8f1c26';
+  roundRect(cx - 55, cy - 42, 12, 8, 3); ctx.fill();
+  roundRect(cx + 43, cy - 42, 12, 8, 3); ctx.fill();
+  // 车灯
+  ctx.fillStyle = S.gas ? '#fff4c8' : '#d9d2a8';
+  roundRect(cx - 30, cy - 78, 16, 6, 3); ctx.fill();
+  roundRect(cx + 14, cy - 78, 16, 6, 3); ctx.fill();
+  ctx.fillStyle = S.brake ? '#ff3b30' : '#7a2a2a';
+  roundRect(cx - 30, cy + 72, 16, 6, 3); ctx.fill();
+  roundRect(cx + 14, cy + 72, 16, 6, 3); ctx.fill();
+
+  // 刹车尾灯红色光晕
+  if (S.brake) {
+    shadow('rgba(255,59,48,.55)', 26, 0);
+    ctx.fillStyle = 'rgba(255,59,48,.5)';
+    roundRect(cx - 32, cy + 70, 20, 10, 4); ctx.fill();
+    roundRect(cx + 12, cy + 70, 20, 10, 4); ctx.fill();
+    noShadow();
+  }
+  ctx.restore();
+}
+
+// --- 座舱：脚 + 刹车踏板 + 受力（侧视） ---
+function drawCabin(){
+  const x0 = CAB_X, w = W - CAB_X;
+
+  // 顶部标题
+  ctx.fillStyle = 'rgba(255,255,255,.30)';
+  ctx.font = '600 12px ui-monospace,Consolas,monospace';
+  ctx.textAlign = 'left';
+  ctx.fillText('脚踏视角 / FOOTWELL', x0 + 18, 24);
+
+  const rig = footRig();
+
+  // ---------- 地板 + 脚垫 ----------
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(FLOOR_A.x, FLOOR_A.y); ctx.lineTo(FLOOR_B.x, FLOOR_B.y);
+  ctx.lineTo(W, H); ctx.lineTo(x0, H); ctx.closePath();
+  ctx.clip();
+  // 地板光晕（左上角光源）
+  const fg = ctx.createLinearGradient(x0, FLOOR_A.y, W, H);
+  fg.addColorStop(0, '#2b313d'); fg.addColorStop(0.55, '#1f242c'); fg.addColorStop(1, '#161a20');
+  ctx.fillStyle = fg; ctx.fillRect(x0, FLOOR_A.y - 12, w, H);
+  // 脚垫纹路
+  ctx.strokeStyle = 'rgba(255,255,255,.045)'; ctx.lineWidth = 1;
+  for (let i = -6; i < 26; i++) {
+    ctx.beginPath();
+    ctx.moveTo(x0 + i * 26, FLOOR_A.y - 10);
+    ctx.lineTo(x0 + i * 26 + 120, H);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(x0 + i * 26, H);
+    ctx.lineTo(x0 + i * 26 + 120, FLOOR_A.y - 10);
+    ctx.stroke();
+  }
+  ctx.restore();
+
+  // 地板边线
+  ctx.strokeStyle = 'rgba(255,255,255,.10)'; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.moveTo(FLOOR_A.x, FLOOR_A.y); ctx.lineTo(FLOOR_B.x, FLOOR_B.y); ctx.stroke();
+
+  // ---------- 防火墙 / 仪表台下沿 ----------
+  const wallG = ctx.createLinearGradient(x0, 0, CAB_X + 120, 0);
+  wallG.addColorStop(0, '#2b313b'); wallG.addColorStop(0.7, '#171a21'); wallG.addColorStop(1, 'rgba(23,26,33,0)');
+  ctx.fillStyle = wallG;
+  ctx.beginPath();
+  ctx.moveTo(x0, 0); ctx.lineTo(CAB_X + 118, 0);
+  ctx.lineTo(CAB_X + 62, FLOOR_A.y); ctx.lineTo(x0, FLOOR_A.y + 8);
+  ctx.closePath(); ctx.fill();
+  // 仪表台下沿高光
+  ctx.strokeStyle = 'rgba(255,255,255,.10)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(x0, 62); ctx.lineTo(CAB_X + 96, 74); ctx.stroke();
+  // 踏板支架（焊接在仪表台下方）
+  ctx.fillStyle = '#4d545f';
+  roundRect(PED_PIVOT.x - 26, PED_PIVOT.y - 24, 56, 26, 7); ctx.fill();
+  ctx.fillStyle = '#767d88';
+  roundRect(PED_PIVOT.x - 20, PED_PIVOT.y - 20, 44, 7, 3); ctx.fill();
+  ctx.fillStyle = 'rgba(255,255,255,.22)';
+  ctx.font = '600 10px ui-monospace,Consolas,monospace';
+  ctx.textAlign = 'right';
+  ctx.fillText('踏板转轴 / PIVOT', PED_PIVOT.x - 34, PED_PIVOT.y - 8);
+  ctx.textAlign = 'left';
+
+  drawPedal(rig);
+  drawFoot(rig);
+  drawForceReadout();
+}
+
+function drawPedal(rig){
+  const r = Math.min(1, S.force / BREAK_FORCE);
+  const h = pedalHinge(), d = pedalDir();
+  const nrm = { x: -d.y, y: d.x };
+  const stub = pedalStub();
+
+  // 断裂后：转轴处只剩一小截折断的臂
+  const endPt = S.broken ? stub : rig.pad;
+  const flex = r * 7;
+  const mid = {
+    x: h.x + d.x * PED_LEN * 0.5 - nrm.x * flex,
+    y: h.y + d.y * PED_LEN * 0.5 - nrm.y * flex
+  };
+  if (S.wobble > 0) {
+    const sh = Math.sin(performance.now() / 24) * 0.8 * S.wobble;
+    mid.x += nrm.x * sh; mid.y += nrm.y * sh;
+  }
+
+  // 踏板臂（金属杆，受力时向防火墙侧弯曲）
+  ctx.save();
+  ctx.lineCap = 'round';
+  ctx.strokeStyle = '#191d23'; ctx.lineWidth = 22;
+  ctx.beginPath(); ctx.moveTo(h.x, h.y); ctx.quadraticCurveTo(mid.x, mid.y, endPt.x, endPt.y); ctx.stroke();
+  const armG = ctx.createLinearGradient(h.x - 9, 0, h.x + 9, 0);
+  armG.addColorStop(0, '#4c535d'); armG.addColorStop(0.42, '#939ba6'); armG.addColorStop(0.75, '#6d747f'); armG.addColorStop(1, '#3f454e');
+  ctx.strokeStyle = armG; ctx.lineWidth = 15;
+  ctx.beginPath(); ctx.moveTo(h.x, h.y); ctx.quadraticCurveTo(mid.x, mid.y, endPt.x, endPt.y); ctx.stroke();
+  // 杆身细高光
+  ctx.strokeStyle = 'rgba(255,255,255,.22)'; ctx.lineWidth = 2.4;
+  ctx.beginPath(); ctx.moveTo(h.x - 3, h.y + 8); ctx.quadraticCurveTo(mid.x - 3, mid.y, endPt.x - 3, endPt.y - 8); ctx.stroke();
+
+  // 转轴销
+  ctx.fillStyle = '#9aa2ad';
+  ctx.beginPath(); ctx.arc(h.x, h.y, 8, 0, 7); ctx.fill();
+  ctx.fillStyle = '#3b414b';
+  ctx.beginPath(); ctx.arc(h.x, h.y, 3.4, 0, 7); ctx.fill();
+
+  // 断裂断口
+  if (S.broken) {
+    ctx.fillStyle = '#c9ced6';
+    ctx.beginPath(); ctx.arc(endPt.x, endPt.y, 8, 0, 7); ctx.fill();
+    ctx.fillStyle = 'rgba(255,120,110,.85)';
+    ctx.beginPath(); ctx.arc(endPt.x, endPt.y, 4.2, 0, 7); ctx.fill();
+  }
+  ctx.restore();
+
+  if (S.broken) return;    // 踏板面已飞走
+
+  // ---------- 踏板面 ----------
+  const pad = rig.pad;
+  ctx.save();
+  ctx.translate(pad.x, pad.y);
+  ctx.rotate(-S.pedAng);                   // 局部 +y = 踏板面法线（朝脚）
+
+  // 应力发光
+  if (r > 0.25) {
+    shadow(`rgba(255,${Math.round(205 - 175 * r)},70,${0.25 + 0.55 * r})`, 14 + 30 * r, 0);
+    ctx.fillStyle = `rgba(255,${Math.round(190 - 160 * r)},70,${0.08 + 0.22 * r})`;
+    roundRect(-22, -5, 44, 74, 16); ctx.fill();
+    noShadow();
+  }
+  // 橡胶踏板面
+  const padG = ctx.createLinearGradient(-13, 0, 13, 0);
+  if (r > 0.8) { padG.addColorStop(0, '#8e2321'); padG.addColorStop(0.4, '#e8564c'); padG.addColorStop(1, '#7a1c1c'); }
+  else { padG.addColorStop(0, '#2a3038'); padG.addColorStop(0.4, '#454d58'); padG.addColorStop(1, '#23282f'); }
+  ctx.fillStyle = padG;
+  roundRect(-14, -32, 28, 66, 10); ctx.fill();
+  // 防滑横纹
+  ctx.fillStyle = 'rgba(0,0,0,.42)';
+  for (let i = -24; i <= 22; i += 9) { roundRect(-11, i, 22, 4, 2); ctx.fill(); }
+  ctx.fillStyle = 'rgba(255,255,255,.10)';
+  for (let i = -24; i <= 22; i += 9) { roundRect(-11, i, 22, 1.4, 1); ctx.fill(); }
+  // 鞋与踏板接触处的压痕高光（有受力时）
+  if (r > 0.05) {
+    ctx.fillStyle = `rgba(255,240,220,${0.10 + 0.32 * r})`;
+    roundRect(-13, -34, 26, 4, 2); ctx.fill();
+  }
+  // 侧边金属包边
+  ctx.fillStyle = 'rgba(190,198,208,.55)';
+  roundRect(-16, -32, 3, 66, 1.5); ctx.fill();
+  ctx.restore();
+
+  // 受力方向箭头
+  if (r > 0.18) {
+    const cx = pad.x + nrm.x * 30, cy = pad.y + nrm.y * 30;
+    ctx.save();
+    ctx.translate(cx, cy); ctx.rotate(Math.atan2(-d.y, -d.x) + Math.PI / 2 + Math.PI);
+    ctx.globalAlpha = 0.3 + 0.6 * r;
+    ctx.fillStyle = `rgba(255,${Math.round(205 - 165 * r)},90,1)`;
+    ctx.beginPath();
+    ctx.moveTo(-11, 0); ctx.lineTo(11, 0); ctx.lineTo(11, 14);
+    ctx.lineTo(0, 26); ctx.lineTo(-11, 14); ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+}
+
+function drawFoot(rig){
+  const { heel, ankle, toe } = rig;
+  const axis = rig.footAng - 0.12;     // 鞋底基本放平，脚尖略抬
+  const L = FOOT.len;
+  const knee = { x: ankle.x + 34 + rig.padOff.x * 0.35 * rig.k, y: ankle.y - 196 + rig.padOff.y * 0.35 * rig.k };
+  const thighEnd = { x: knee.x + 196, y: knee.y - 58 };
+
+  // 地面投影
+  ctx.save();
+  const fy = FLOOR_A.y + (heel.x - FLOOR_A.x) / (FLOOR_B.x - FLOOR_A.x) * (FLOOR_B.y - FLOOR_A.y);
+  ctx.fillStyle = 'rgba(0,0,0,.40)';
+  ctx.beginPath();
+  ctx.ellipse(heel.x + 8, fy + 6, 74, 12, 0, 0, 7);
+  ctx.fill();
+  ctx.restore();
+
+  // 小腿 + 大腿（在鞋后面；裤管延伸到脚踝以下，盖住鞋口）
+  const sv = { x: ankle.x - knee.x, y: ankle.y - knee.y };
+  const sl = Math.hypot(sv.x, sv.y) || 1;
+  const lowEnd = { x: ankle.x + sv.x / sl * 26, y: ankle.y + sv.y / sl * 26 };
+  ctx.save();
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  ctx.strokeStyle = '#1c2229'; ctx.lineWidth = 46;
+  ctx.beginPath(); ctx.moveTo(thighEnd.x, thighEnd.y); ctx.lineTo(knee.x, knee.y); ctx.lineTo(lowEnd.x, lowEnd.y); ctx.stroke();
+  ctx.strokeStyle = '#39424e'; ctx.lineWidth = 36;
+  ctx.beginPath(); ctx.moveTo(thighEnd.x, thighEnd.y); ctx.lineTo(knee.x, knee.y); ctx.lineTo(lowEnd.x, lowEnd.y); ctx.stroke();
+  // 小腿受光侧
+  ctx.strokeStyle = 'rgba(255,255,255,.12)'; ctx.lineWidth = 9;
+  ctx.beginPath();
+  ctx.moveTo(thighEnd.x + 8, thighEnd.y - 8); ctx.lineTo(knee.x + 9, knee.y - 5); ctx.lineTo(lowEnd.x + 8, lowEnd.y - 5);
+  ctx.stroke();
+  ctx.restore();
+
+  // ---------- 黑色皮鞋（脚跟→前脚掌，鞋尖压在踏板面上） ----------
+  const shoeRot = axis;            // 鞋局部 +x = 足轴（脚跟 → 鞋尖）
+
+  // 地面接触阴影（鞋底投影，画在鞋局部以避免翻转）
+  ctx.save();
+  ctx.translate(heel.x, heel.y);
+  ctx.rotate(shoeRot);
+  ctx.fillStyle = 'rgba(0,0,0,.34)';
+  ctx.beginPath(); ctx.ellipse(L * 0.45, 22, L * 0.55, 10, 0, 0, 7); ctx.fill();
+  ctx.restore();
+
+  ctx.save();
+  ctx.translate(heel.x, heel.y);
+  ctx.rotate(shoeRot);
+
+  // 鞋底沿条
+  ctx.fillStyle = '#22232a';
+  ctx.beginPath();
+  ctx.moveTo(-11, 10);
+  ctx.lineTo(L + 2, -8);
+  ctx.quadraticCurveTo(L + 8, -12, L - 3, -13);
+  ctx.lineTo(-9, 0);
+  ctx.quadraticCurveTo(-15, 5, -11, 10);
+  ctx.closePath(); ctx.fill();
+  // 沿条缝线
+  ctx.strokeStyle = 'rgba(255,255,255,.13)'; ctx.lineWidth = 1.3;
+  for (let i = 1; i < 8; i++) {
+    const t = i / 8;
+    ctx.beginPath();
+    ctx.moveTo(-11 + (L + 19) * t, 9 - 21 * t);
+    ctx.lineTo(-7 + (L + 19) * t, 4 - 21 * t);
+    ctx.stroke();
+  }
+  // 鞋跟块
+  ctx.fillStyle = '#191a1f';
+  ctx.beginPath();
+  ctx.moveTo(-11, 11); ctx.lineTo(13, 11); ctx.lineTo(11, -3);
+  ctx.quadraticCurveTo(-4, -1, -11, 3);
+  ctx.closePath(); ctx.fill();
+
+  // 鞋帮（黑色皮革）
+  ctx.save();
+  shadow('rgba(0,0,0,.55)', 16, 6);
+  const shoeG = ctx.createLinearGradient(0, -40, 0, 10);
+  shoeG.addColorStop(0, '#4d5059');
+  shoeG.addColorStop(0.20, '#2c2f37');
+  shoeG.addColorStop(0.60, '#17181d');
+  shoeG.addColorStop(1, '#0a0b0e');
+  ctx.fillStyle = shoeG;
+  ctx.beginPath();
+  ctx.moveTo(-14, 7);
+  ctx.quadraticCurveTo(-20, -8, -12, -22);         // 后跟
+  ctx.quadraticCurveTo(-7, -33, 3, -33);           // 鞋口后沿
+  ctx.quadraticCurveTo(15, -33, 21, -26);          // 鞋口前沿
+  ctx.quadraticCurveTo(L * 0.58, -30, L - 3, -16); // 鞋面（脚背起伏）
+  ctx.quadraticCurveTo(L + 9, -6, L - 1, 3);       // 圆润鞋头
+  ctx.lineTo(-10, 10);
+  ctx.closePath(); ctx.fill();
+  noShadow();
+  // 轮廓边光（黑皮鞋在暗环境里也要看得出形状）
+  ctx.strokeStyle = 'rgba(178,190,206,.50)'; ctx.lineWidth = 2.2; ctx.lineJoin = 'round';
+  ctx.stroke();
+  ctx.strokeStyle = 'rgba(255,255,255,.14)'; ctx.lineWidth = 0.9;
+  ctx.stroke();
+  ctx.restore();
+
+  // 鞋头光泽
+  ctx.fillStyle = 'rgba(255,255,255,.15)';
+  ctx.beginPath();
+  ctx.moveTo(L - 26, -15); ctx.quadraticCurveTo(L + 2, -12, L, -2);
+  ctx.quadraticCurveTo(L - 12, -6, L - 29, -9);
+  ctx.closePath(); ctx.fill();
+  // 鞋面折痕高光
+  ctx.fillStyle = 'rgba(255,255,255,.08)';
+  ctx.beginPath();
+  ctx.moveTo(L - 46, -18); ctx.quadraticCurveTo(L - 32, -10, L - 22, -9);
+  ctx.quadraticCurveTo(L - 30, -15, L - 34, -21);
+  ctx.closePath(); ctx.fill();
+  // 后跟高光
+  ctx.fillStyle = 'rgba(255,255,255,.07)';
+  ctx.beginPath();
+  ctx.moveTo(-13, -4); ctx.quadraticCurveTo(-16, -14, -10, -21);
+  ctx.quadraticCurveTo(-6, -14, -6, -4);
+  ctx.closePath(); ctx.fill();
+
+  // 鞋口（脚踝伸入处）
+  ctx.fillStyle = '#05060a';
+  ctx.beginPath(); ctx.ellipse(4, -27, 17, 8, 0.06, 0, 7); ctx.fill();
+  // 系带
+  ctx.strokeStyle = 'rgba(210,215,225,.28)'; ctx.lineWidth = 2.2; ctx.lineCap = 'round';
+  for (let i = 0; i < 2; i++) {
+    const x = 24 + i * 13;
+    ctx.beginPath(); ctx.moveTo(x, -26 + i * 1.8); ctx.lineTo(x + 10, -19 + i * 1.8); ctx.stroke();
+  }
+  ctx.restore();
+
+  // ---------- 脚踝皮肤 / 袜子 / 裤脚 ----------
+  ctx.save();
+  ctx.translate(ankle.x, ankle.y);
+  ctx.rotate(Math.atan2(ankle.y - knee.y, ankle.x - knee.x) - Math.PI / 2);
+  // 露出的皮肤（鞋口与裤脚之间）
+  ctx.fillStyle = '#efc69f';
+  roundRect(-19, -12, 38, 26, 9); ctx.fill();
+  ctx.fillStyle = 'rgba(178,126,86,.42)';
+  roundRect(-19, 2, 38, 12, 6); ctx.fill();
+  // 袜口
+  ctx.fillStyle = '#222831';
+  roundRect(-20, -30, 40, 26, 8); ctx.fill();
+  ctx.fillStyle = 'rgba(255,255,255,.07)';
+  roundRect(-15, -27, 9, 20, 4); ctx.fill();
+  // 裤脚（下沿压到脚踝以下）
+  const cuffG = ctx.createLinearGradient(-26, 0, 26, 0);
+  cuffG.addColorStop(0, '#252d38'); cuffG.addColorStop(0.42, '#3d4855'); cuffG.addColorStop(1, '#1f2731');
+  ctx.fillStyle = cuffG;
+  roundRect(-22, -104, 44, 100, 11); ctx.fill();
+  ctx.strokeStyle = 'rgba(0,0,0,.30)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(-24, -2); ctx.lineTo(24, -2); ctx.stroke();
+  ctx.strokeStyle = 'rgba(255,255,255,.10)'; ctx.lineWidth = 1.4;
+  ctx.beginPath(); ctx.moveTo(-24, -6); ctx.lineTo(24, -6); ctx.stroke();
+  ctx.restore();
+}
+
+
+function drawForceReadout(){
+  const x0 = CAB_X, w = W - CAB_X;
+  const r = Math.min(1, S.force / BREAK_FORCE);
+
+  ctx.save();
+  // 受力面板底衬
+  ctx.fillStyle = 'rgba(10,12,16,.55)';
+  roundRect(x0 + 14, 424, w - 28, 122, 14); ctx.fill();
+  // 数值
+  ctx.textAlign = 'center';
+  ctx.fillStyle = 'rgba(255,255,255,.34)';
+  ctx.font = '600 12px ui-monospace,Consolas,monospace';
+  ctx.fillText('刹车踏板受力 / PEDAL FORCE', x0 + w / 2, 446);
+
+  let col = '#6ee7a8';
+  if (r > 0.85) col = '#ff4d4f'; else if (r > 0.65) col = '#ffb020'; else if (r > 0.35) col = '#ffd166';
+  shadow(col, 22, 0);
+  ctx.fillStyle = col;
+  ctx.font = '700 42px ui-monospace,Consolas,monospace';
+  ctx.fillText(Math.round(S.force) + '', x0 + w / 2 - 16, 486);
+  noShadow();
+  ctx.font = '700 18px ui-monospace,Consolas,monospace';
+  ctx.fillStyle = 'rgba(255,255,255,.65)';
+  ctx.fillText('N', x0 + w / 2 + 56, 486);
+
+  // 进度条
+  const bx = x0 + 40, bw = w - 80, by = 504;
+  ctx.fillStyle = 'rgba(255,255,255,.10)';
+  roundRect(bx, by, bw, 12, 6); ctx.fill();
+  const gg = ctx.createLinearGradient(bx, 0, bx + bw, 0);
+  gg.addColorStop(0, '#3ddc97'); gg.addColorStop(0.6, '#ffcc4d'); gg.addColorStop(1, '#ff4d4f');
+  ctx.save();
+  roundRect(bx, by, Math.max(8, bw * r), 12, 6); ctx.clip();
+  ctx.fillStyle = gg; ctx.fillRect(bx, by, bw, 12);
+  ctx.restore();
+  // 断裂阈值刻度
+  ctx.fillStyle = '#ff4d4f';
+  ctx.fillRect(bx + bw - 3, by - 4, 4, 20);
+  ctx.fillStyle = 'rgba(255,77,79,.9)';
+  ctx.font = '600 11px ui-monospace,Consolas,monospace';
+  ctx.textAlign = 'right';
+  ctx.fillText('断裂阈值 1600N', bx + bw, by + 26);
+
+  // 状态提示
+  ctx.textAlign = 'left';
+  ctx.font = '600 11px ui-monospace,Consolas,monospace';
+  const msg = S.broken ? '踏板已断裂' : (S.pedal === 'pressed' ? '正在踩刹车（按住 ↓ 才有效）' : '刹车踏板未受力');
+  ctx.fillStyle = S.broken ? '#ff4d4f' : 'rgba(255,255,255,.40)';
+  ctx.fillText(msg, bx, by + 26);
+  ctx.restore();
+}
+
+// --- 时速表 ---
+function drawHUD(){
+  ctx.save();
+  // 面板
+  ctx.fillStyle = 'rgba(11,13,17,.80)';
+  roundRect(18, 250, 520, 296, 20); ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,.08)'; ctx.lineWidth = 1;
+  roundRect(18, 250, 520, 296, 20); ctx.stroke();
+
+  // 拱形表盘：下端开口朝上，指针向正中竖立
+  const cx = 278, cy = 522, R = 104;
+  const A0 = Math.PI * 5 / 6, A1 = Math.PI * 13 / 6;   // 150° → 390°
+  const oy = 250, hgt = 296;
+
+  // 刻度
+  for (let v = 0; v <= MAX_SPEED; v += 20) {
+    const a = A0 + (A1 - A0) * (v / MAX_SPEED);
+    const big = v % 40 === 0;
+    const rOut = R, rIn = R - (big ? 14 : 8);
+    ctx.strokeStyle = v >= 180 ? 'rgba(255,96,96,.9)' : 'rgba(214,226,238,.5)';
+    ctx.lineWidth = big ? 2.6 : 1.3;
+    ctx.beginPath();
+    ctx.moveTo(cx + Math.cos(a) * rIn, cy + Math.sin(a) * rIn);
+    ctx.lineTo(cx + Math.cos(a) * rOut, cy + Math.sin(a) * rOut);
+    ctx.stroke();
+    if (big) {
+      ctx.fillStyle = S.speed >= v - 20 ? 'rgba(255,255,255,.95)' : 'rgba(255,255,255,.35)';
+      ctx.font = '700 12px ui-monospace,Consolas,monospace';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(v, cx + Math.cos(a) * (R + 16), cy + Math.sin(a) * (R + 16));
+    }
+  }
+
+  const aS = A0 + (A1 - A0) * (S.speed / MAX_SPEED);
+  // 走过的弧光
+  ctx.strokeStyle = 'rgba(110,231,168,.55)'; ctx.lineWidth = 4; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.arc(cx, cy, R + 10, A0, aS); ctx.stroke();
+
+  // 指针
+  ctx.save();
+  ctx.translate(cx, cy); ctx.rotate(aS);
+  shadow('rgba(255,80,80,.65)', 14, 0);
+  ctx.fillStyle = '#ff5252';
+  ctx.beginPath(); ctx.moveTo(-6, 6); ctx.lineTo(0, -(R - 8)); ctx.lineTo(6, 6); ctx.closePath(); ctx.fill();
+  noShadow();
+  ctx.restore();
+  ctx.fillStyle = '#dfe5ee';
+  ctx.beginPath(); ctx.arc(cx, cy, 9, 0, 7); ctx.fill();
+
+  // 数字读数（顶部左侧）
+  ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+  ctx.fillStyle = 'rgba(255,255,255,.34)';
+  ctx.font = '600 12px ui-monospace,Consolas,monospace';
+  ctx.fillText('SPEED 时速', 48, 282);
+  shadow('rgba(160,220,255,.45)', 16, 0);
+  ctx.fillStyle = '#eaf3ff';
+  ctx.font = '700 44px ui-monospace,Consolas,monospace';
+  ctx.fillText(String(Math.round(S.speed)).padStart(3, '0'), 48, 330);
+  noShadow();
+  ctx.fillStyle = 'rgba(255,255,255,.5)';
+  ctx.font = '600 14px ui-monospace,Consolas,monospace';
+  ctx.fillText('km/h', 158, 330);
+  // 速度条
+  ctx.fillStyle = 'rgba(255,255,255,.10)';
+  roundRect(48, 344, 170, 8, 4); ctx.fill();
+  const sg = ctx.createLinearGradient(48, 0, 218, 0);
+  sg.addColorStop(0, '#6ee7a8'); sg.addColorStop(0.7, '#7ec8ff'); sg.addColorStop(1, '#ff8f6b');
+  ctx.save();
+  roundRect(48, 344, Math.max(6, 170 * (S.speed / MAX_SPEED)), 8, 4); ctx.clip();
+  ctx.fillStyle = sg; ctx.fillRect(48, 344, 170, 8);
+  ctx.restore();
+
+  // 油门/刹车状态灯（顶部右侧，左右并排）
+  const lamp = (x, y, w, on, onCol, label) => {
+    ctx.fillStyle = on ? onCol : 'rgba(255,255,255,.12)';
+    if (on) shadow(onCol, 14, 0);
+    roundRect(x, y, w, 30, 9); ctx.fill(); noShadow();
+    ctx.fillStyle = on ? '#0b0d11' : 'rgba(255,255,255,.42)';
+    ctx.font = '700 13px ui-monospace,Consolas,monospace';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(label, x + w / 2, y + 15);
+    ctx.textBaseline = 'alphabetic';
+  };
+  lamp(378, 288, 74, S.gas,   '#6ee7a8', '油门');
+  lamp(462, 288, 74, S.brake, '#ff5252', '刹车');
+
+  // 操作提示
+  ctx.fillStyle = 'rgba(255,255,255,.30)';
+  ctx.font = '600 12px ui-monospace,Consolas,monospace';
+  ctx.textAlign = 'left';
+  ctx.fillText(IS_TOUCH ? '按住下方 加速 / 刹车 按钮　·　最上面 1600N 会断裂'
+                        : '空格 / ↑ 加速　　↓ / S 刹车　　R 重开', 48, 480);
+  ctx.restore();
+
+  // 开局提示
+  if (S.phase === 'drive' && S.idle > 2.2 && S.force === 0) {
+    const a = Math.min(1, (S.idle - 2.2) / 0.5) * (0.62 + 0.38 * Math.sin(performance.now() / 320));
+    ctx.save();
+    ctx.globalAlpha = a;
+    ctx.textAlign = 'center';
+    ctx.fillStyle = 'rgba(10,12,16,.72)';
+    roundRect(228, 196, 340, 62, 14); ctx.fill();
+    ctx.fillStyle = '#eaf3ff';
+    ctx.font = '700 17px "Microsoft YaHei",system-ui,sans-serif';
+    ctx.fillText(IS_TOUCH ? '按住「加速」' : '按 空格 加速', 398, 222);
+    ctx.fillStyle = '#ff8a80';
+    ctx.font = '700 17px "Microsoft YaHei",system-ui,sans-serif';
+    ctx.fillText('按 ↓ 踩刹车（超过 1600N 会踩断）', 398, 246);
+    ctx.restore();
+  }
+
+  // 手机竖屏提示：横过来能看到的画面大得多
+  if (IS_TOUCH && window.innerHeight > window.innerWidth * 1.05 && S.phase === 'drive') {
+    ctx.save();
+    ctx.textAlign = 'center';
+    ctx.globalAlpha = 0.55 + 0.45 * Math.sin(performance.now() / 520);
+    ctx.fillStyle = 'rgba(8,10,14,.82)';
+    roundRect(W / 2 - 150, 14, 300, 40, 12); ctx.fill();
+    ctx.fillStyle = '#9fd6ff';
+    ctx.font = '700 15px "Microsoft YaHei",system-ui,sans-serif';
+    ctx.fillText('横过手机玩，画面更大 ↻', W / 2, 40);
+    ctx.restore();
+  }
+}
+
+// --- 特效：断裂闪光/碎片/火花 ---
+function drawFx(){
+  for (const sp of S.sparks) {
+    const a = Math.max(0, sp.life / sp.max);
+    ctx.fillStyle = `rgba(255,${Math.round(180 + 60 * a)},90,${a})`;
+    ctx.beginPath(); ctx.arc(sp.x, sp.y, 2 + 2 * a, 0, 7); ctx.fill();
+  }
+  for (const f of S.frags) {
+    ctx.save();
+    ctx.translate(f.x, f.y); ctx.rotate(f.a);
+    if (f.pad) {
+      // 断掉的踏板面
+      const gg = ctx.createLinearGradient(-f.h / 2, 0, f.h / 2, 0);
+      gg.addColorStop(0, '#1f242b'); gg.addColorStop(0.45, '#454d58'); gg.addColorStop(1, '#22272e');
+      ctx.fillStyle = gg;
+      roundRect(-f.h / 2, -f.w / 2, f.h, f.w, 8); ctx.fill();
+      ctx.fillStyle = 'rgba(0,0,0,.42)';
+      for (let i = -f.w / 2 + 6; i <= f.w / 2 - 10; i += 9) { roundRect(-f.h / 2 + 4, i, f.h - 8, 3.4, 1.6); ctx.fill(); }
+      ctx.fillStyle = 'rgba(190,198,208,.5)';
+      ctx.fillRect(-f.h / 2 + 1, -f.w / 2, 2.6, f.w);
+      // 断口
+      ctx.fillStyle = '#c9ced6';
+      ctx.beginPath(); ctx.arc(0, -f.w / 2 + 3, 6, 0, 7); ctx.fill();
+      ctx.fillStyle = 'rgba(255,120,110,.8)';
+      ctx.beginPath(); ctx.arc(0, -f.w / 2 + 3, 3, 0, 7); ctx.fill();
+    } else {
+      const gg = ctx.createLinearGradient(-f.w/2, 0, f.w/2, 0);
+      gg.addColorStop(0, '#7e858f'); gg.addColorStop(0.5, '#dfe4ea'); gg.addColorStop(1, '#69707a');
+      ctx.fillStyle = gg;
+      roundRect(-f.w / 2, -f.h / 2, f.w, f.h, 3); ctx.fill();
+      ctx.fillStyle = 'rgba(255,255,255,.35)';
+      ctx.fillRect(-f.w / 2 + 3, -f.h / 2 + 2, f.w - 6, 1.6);
+    }
+    ctx.restore();
+  }
+  if (S.flash > 0) {
+    ctx.fillStyle = `rgba(255,235,190,${0.34 * S.flash})`;
+    ctx.fillRect(0, 0, W, H);
+  }
+  // 危险红闪
+  const r = S.force / BREAK_FORCE;
+  if (S.phase === 'drive' && r > 0.7) {
+    const pulse = (Math.sin(performance.now() / 90) * 0.5 + 0.5) * (r - 0.7) / 0.3;
+    const vg = ctx.createRadialGradient(W/2, H/2, H*0.32, W/2, H/2, H*0.92);
+    vg.addColorStop(0, 'rgba(255,0,0,0)');
+    vg.addColorStop(1, `rgba(255,40,40,${0.34 * pulse})`);
+    ctx.fillStyle = vg; ctx.fillRect(0, 0, W, H);
+  }
+}
+
+// --- 失败界面 ---
+function drawFail(){
+  const t = S.failT;
+  const k = Math.min(1, t / 0.45);
+  ctx.save();
+  ctx.fillStyle = `rgba(8,9,12,${0.62 * k})`;
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.textAlign = 'center';
+  // 标语
+  const pop = 1 + 0.14 * Math.exp(-t * 7) * Math.cos(t * 22);
+  ctx.save();
+  ctx.translate(W / 2, 218);
+  ctx.scale(pop, pop);
+  shadow('rgba(255,60,60,.65)', 34, 0);
+  const tg = ctx.createLinearGradient(-160, -40, 160, 40);
+  tg.addColorStop(0, '#fff3b0'); tg.addColorStop(0.5, '#ffd54a'); tg.addColorStop(1, '#ff9f1a');
+  ctx.fillStyle = tg;
+  ctx.font = '900 74px "Microsoft YaHei",system-ui,sans-serif';
+  ctx.fillText('遥遥领先', 0, 0);
+  noShadow();
+  ctx.restore();
+
+  ctx.fillStyle = 'rgba(255,255,255,.62)';
+  ctx.font = '600 15px ui-monospace,Consolas,monospace';
+  ctx.fillText('刹车踏板受力 ' + Math.round(S.force) + ' N / 1600 N　已断裂　车辆失去制动力', W / 2, 268);
+
+  // 重试按钮
+  if (t > 0.55) {
+    const a = Math.min(1, (t - 0.55) / 0.3);
+    const hover = S.hover;
+    const pulse = 1 + 0.03 * Math.sin(performance.now() / 240);
+    ctx.save();
+    ctx.globalAlpha = a;
+    ctx.translate(W / 2, BTN.y + BTN.h / 2);
+    ctx.scale(hover ? 1.05 : pulse, hover ? 1.05 : pulse);
+    shadow(hover ? 'rgba(110,231,168,.75)' : 'rgba(110,231,168,.4)', 28, 6);
+    ctx.fillStyle = hover ? '#8df3bc' : '#6ee7a8';
+    roundRect(-BTN.w / 2, -BTN.h / 2, BTN.w, BTN.h, 14); ctx.fill();
+    noShadow();
+    ctx.fillStyle = '#0b0d11';
+    ctx.font = '800 24px "Microsoft YaHei",system-ui,sans-serif';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('重 试', 0, 2);
+    ctx.textBaseline = 'alphabetic';
+    ctx.restore();
+  }
+  ctx.fillStyle = 'rgba(255,255,255,.32)';
+  ctx.font = '600 12px ui-monospace,Consolas,monospace';
+  ctx.fillText('按 R 或点击按钮重新开始', W / 2, 492);
+  ctx.restore();
+}
+
+// ---------- loop ----------
+// ?sim=秒数 可确定性推进模拟（仅用于自动化自测），不影响正常游玩
+if (Q.has('sim')) {
+  const total = Math.max(0, parseFloat(Q.get('sim')) || 0), step = 1 / 120;
+  if (Q.has('keys')) for (const c of Q.get('keys').split(',')) keys[c] = true;
+  for (let t = 0; t < total; t += step) update(step);
+  FROZEN = true;
+}
+
+let last = performance.now();
+function frame(now){
+  let dt = (now - last) / 1000; last = now;
+  if (dt > 0.05) dt = 0.05;
+  // 首次交互后启用音频
+  if (!AC && (keys['Space'] || keys['ArrowUp'] || keys['ArrowDown'] || keys['KeyW'] || keys['KeyS'])) audioInit();
+  update(dt);
+  // 触屏 UI：按钮高亮跟随输入；静止一会儿自动淡出，露出完整画面
+  if (IS_TOUCH) {
+    if (touch.gas || touch.brake) barHideAt = performance.now() + 4200;
+    else if (performance.now() > barHideAt) hideTouchBar();
+    syncPadVisual();
+  }
+  draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// 自动化自测钩子（仅用于开发调试）
+window.__brake = {
+  state: () => ({
+    phase: S.phase, failT: S.failT, breakT: S.breakT, broken: S.broken,
+    force: S.force, speed: S.speed, pedal: S.pedal,
+    frags: S.frags.length, TRANS, RESETS, gas: S.gas, brake: S.brake,
+    touchMode: document.body.classList.contains('touch'),
+    touchGas: touch.gas, touchBrake: touch.brake
+  }),
+  step: (n, dt) => { for (let i = 0; i < (n || 1); i++) update(dt || 1 / 120); },
+  keys: (o) => { for (const k in o) keys[k] = o[k]; }
+};
+})();
+</script>
+</body>
+</html>
