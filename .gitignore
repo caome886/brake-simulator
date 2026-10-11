@@ -2,6 +2,8 @@
 gh-token.txt
 *.token
 .gh-token
+.gh-browser/
+netlify-url.txt
 node_modules/
 Thumbs.db
 desktop.ini
