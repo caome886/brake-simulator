@@ -33,6 +33,7 @@ const FILES = [
   'cdp-mobile-test.js',
   'cdp-live-test.js',
   'deploy.js',
+  'netlify-deploy.js',
   'gh-web.js',
   'gh-create-repo.js',
   'gh-make-token.js',
@@ -48,7 +49,8 @@ const FILES = [
   'shots/63-mobile-fail.png',
   'shots/64-mobile-autohide.png',
   'shots/65-mobile-landscape.png',
-  'shots/70-live-githubpages.png'
+  'shots/70-live-pages.png',
+  'shots/71-live-netlify.png'
 ];
 
 function readToken() {
