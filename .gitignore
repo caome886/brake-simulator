@@ -1,0 +1,7 @@
+# 凭据与本地垃圾文件，永远不要提交
+gh-token.txt
+*.token
+.gh-token
+node_modules/
+Thumbs.db
+desktop.ini
