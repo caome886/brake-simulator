@@ -31,7 +31,11 @@ const FILES = [
   'serve.js',
   'cdp-test.js',
   'cdp-mobile-test.js',
+  'cdp-live-test.js',
   'deploy.js',
+  'gh-web.js',
+  'gh-create-repo.js',
+  'gh-make-token.js',
   'tools/crop-shots.py',
   'shots/01-idle.png',
   'shots/02-accelerating.png',
@@ -43,7 +47,8 @@ const FILES = [
   'shots/62-mobile-both.png',
   'shots/63-mobile-fail.png',
   'shots/64-mobile-autohide.png',
-  'shots/65-mobile-landscape.png'
+  'shots/65-mobile-landscape.png',
+  'shots/70-live-githubpages.png'
 ];
 
 function readToken() {
