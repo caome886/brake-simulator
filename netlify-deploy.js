@@ -1,10 +1,17 @@
-// 一条命令完成：打开 Netlify Drop → 上传整包 → 轮询读取生成的站点网址
+// Netlify 发布：两种模式
+//   node netlify-deploy.js                      新建站点（Netlify Drop，之后需认领）
+//   node netlify-deploy.js --update <slug>      更新已有站点（往该项目的 Deploys 页上传整包）
+// 需要先有一个带调试端口的 Chrome（默认 9399），并用 CDP_PORT 覆盖。
 'use strict';
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const PORT = process.env.CDP_PORT || 9399;
-const ZIP = path.join(__dirname, process.argv[2] || 'netlify-site.zip');
+
+const argv = process.argv.slice(2);
+const updateSlug = argv.includes('--update') ? argv[argv.indexOf('--update') + 1] : null;
+const zipArg = argv.find(a => /\.zip$/i.test(a));
+const ZIP = path.join(__dirname, zipArg || 'netlify-site.zip');
 
 function jget(p) {
   return new Promise((res, rej) => {
@@ -17,16 +24,14 @@ function jget(p) {
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 (async () => {
-  if (!fs.existsSync(ZIP)) { console.error('整包不存在: ' + ZIP); process.exit(1); }
+  if (!fs.existsSync(ZIP)) { console.error('✗ 整包不存在: ' + ZIP); process.exit(1); }
+
   const page = (await jget('/json/list')).find(t => t.type === 'page');
   const ws = new WebSocket(page.webSocketDebuggerUrl);
-  let id = 0; const pending = new Map(); const net = [];
+  let id = 0; const pending = new Map();
   ws.addEventListener('message', ev => {
     const m = JSON.parse(ev.data);
-    if (m.id && pending.has(m.id)) { pending.get(m.id)(m); pending.delete(m.id); return; }
-    if (m.method === 'Network.requestWillBeSent' && /api\.netlify\.com/.test(m.params.request.url) && /deploys/.test(m.params.request.url)) {
-      net.push(m.params.request.url.slice(0, 100));
-    }
+    if (m.id && pending.has(m.id)) { pending.get(m.id)(m); pending.delete(m.id); }
   });
   const send = (method, params) => new Promise(res => { const mid = ++id; pending.set(mid, res); ws.send(JSON.stringify({ id: mid, method, params: params || {} })); });
   await new Promise(r => ws.addEventListener('open', r));
@@ -36,47 +41,61 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
     if (r.result && r.result.exceptionDetails) return '异常: ' + JSON.stringify(r.result.exceptionDetails).slice(0, 300);
     return r.result && r.result.result && r.result.result.value;
   };
+  const shot = async (name) => {
+    const r = await send('Page.captureScreenshot', { format: 'png' });
+    fs.writeFileSync(path.join(__dirname, 'shots', name), Buffer.from(r.result.data, 'base64'));
+    return name;
+  };
 
-  console.log('→ 打开 Netlify Drop');
-  await send('Page.navigate', { url: 'https://app.netlify.com/drop' });
-  await sleep(7000);
+  const target = updateSlug
+    ? 'https://app.netlify.com/projects/' + updateSlug + '/deploys'
+    : 'https://app.netlify.com/drop';
+  const selector = updateSlug ? '#dropzone-file-upload' : 'input[type=file]';
+
+  console.log('→ 打开 ' + target);
+  await send('Page.navigate', { url: target });
+  await sleep(updateSlug ? 8000 : 7000);
   console.log('  当前地址: ' + await evaluate('location.href'));
 
-  // 塞入 zip
   const doc = await send('DOM.getDocument', { depth: -1 });
-  const q = await send('DOM.querySelector', { nodeId: doc.result.root.nodeId, selector: 'input[type=file]' });
-  if (!q.result.nodeId) { console.error('✗ 没找到文件输入框'); ws.close(); process.exit(1); }
+  const q = await send('DOM.querySelector', { nodeId: doc.result.root.nodeId, selector });
+  if (!q.result.nodeId) { console.error('✗ 没找到上传控件 ' + selector); ws.close(); process.exit(1); }
   console.log('→ 上传 ' + path.basename(ZIP) + '（' + Math.round(fs.statSync(ZIP).size / 1024) + ' KB）');
   await send('DOM.setFileInputFiles', { nodeId: q.result.nodeId, files: [ZIP] });
 
-  // 轮询等待站点网址出现
-  let url = '';
+  // 轮询：更新模式下只要部署完成即可；新建模式需要拿到站点网址
+  let url = '', done = false;
   for (let i = 0; i < 40; i++) {
     await sleep(3000);
     const raw = await evaluate(`JSON.stringify({
       href: location.href,
       links: [].map.call(document.querySelectorAll('a[href]'), function(a){ return a.href; })
                .filter(function(h){ return /netlify\\.app/.test(h) && !/app\\.netlify\\.com/.test(h); }),
-      text: (document.body.innerText||'').replace(/\\s+/g,' ').slice(0, 400)
+      text: (document.body.innerText||'').replace(/\\s+/g,' ').slice(0, 500)
     })`);
     let p; try { p = JSON.parse(raw); } catch (e) { continue; }
-    const uniq = (p.links || []).filter((v, idx, arr) => arr.indexOf(v) === idx);
-    if (uniq.length) { url = uniq.sort((a, b) => a.length - b.length)[0]; break; }
-    if (/^https:\/\/[a-z0-9-]+\.netlify\.app/.test(p.href)) { url = p.href; break; }
-    if (i % 4 === 3) console.log('  等待部署完成… (' + ((i + 1) * 3) + 's) ' + p.text.slice(0, 120));
+    if (updateSlug) {
+      if (/published|已发布|Deployed|部署/i.test(p.text) && !/uploading|正在上传/i.test(p.text)) { done = true; break; }
+    } else {
+      const uniq = (p.links || []).filter((v, idx, arr) => arr.indexOf(v) === idx);
+      if (uniq.length) { url = uniq.sort((a, b) => a.length - b.length)[0]; done = true; break; }
+      if (/^https:\/\/[a-z0-9-]+\.netlify\.app/.test(p.href)) { url = p.href; done = true; break; }
+    }
+    if (i % 5 === 4) console.log('  部署中… (' + ((i + 1) * 3) + 's)');
   }
 
-  if (url) {
+  if (updateSlug) {
+    if (done) console.log('\n✓ 已更新站点: https://' + updateSlug + '.netlify.app/');
+    else console.log('\n? 没确认到部署完成，请到 Deploys 页查看');
+  } else if (url) {
     fs.writeFileSync(path.join(__dirname, 'netlify-url.txt'), url + '\n', 'utf8');
-    console.log('\n✓ Netlify 站点已发布: ' + url);
-    console.log('✓ 已写入 netlify-url.txt');
+    console.log('\n✓ 新站点已发布: ' + url);
+    console.log('  （未认领的站点 1 小时后过期且带密码，需在页面上 Claim this site 并改成 Public）');
   } else {
-    console.log('\n✗ 没读到站点网址。上传请求数: ' + net.length);
-    console.log('  页面状态: ' + await evaluate(`JSON.stringify({href: location.href, text: (document.body.innerText||'').replace(/\\s+/g,' ').slice(0, 700)})`));
+    console.log('\n✗ 没读到站点网址');
+    console.log('  ' + await evaluate(`JSON.stringify({href: location.href, text: (document.body.innerText||'').replace(/\\s+/g,' ').slice(0, 500)})`));
   }
-  const r = await send('Page.captureScreenshot', { format: 'png' });
-  fs.writeFileSync(path.join(__dirname, 'shots', 'netlify-result.png'), Buffer.from(r.result.data, 'base64'));
-  console.log('截图: shots/netlify-result.png');
+  console.log('截图: ' + await shot(updateSlug ? 'netlify-updated.png' : 'netlify-result.png'));
   ws.close();
-  process.exit(url ? 0 : 1);
+  process.exit(done ? 0 : 1);
 })().catch(e => { console.error('ERROR: ' + (e && e.message || e)); process.exit(1); });
